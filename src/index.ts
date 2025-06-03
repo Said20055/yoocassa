@@ -39,21 +39,46 @@ app.post('/api/payment/notification', async (req: Request, res: Response) => {
     console.log(`🔔 Notification received (paymentId=${paymentId}): status="${status}", paid=${paid}, userUID=${userUID}, tariffId=${tariffId}`);
 
     // Если в metadata нет userUID или tariffId, фиксируем это в консоле, но всё равно обновляем статус самого платежа
-    if (!userUID || !tariffId) {
-      console.warn(`⚠️ Metadata is missing userUID or tariffId for payment ${paymentId}. Received metadata=${JSON.stringify(metadata)}`);
+if (!userUID || !tariffId) {
+  console.warn(`⚠️ Metadata is missing userUID or tariffId for payment ${paymentId}. Received metadata=${JSON.stringify(metadata)}`);
+} else {
+  try {
+    // Загружаем тариф
+    const tariffSnap = await db.collection('tariffs').doc(tariffId).get();
+    const tariffData = tariffSnap.data();
+
+    if (!tariffData) {
+      console.warn(`❌ Tariff not found for id: ${tariffId}`);
     } else {
-      // 1) Обновляем документ пользователя: ставим activeTariffId и subscriptionStartDate
-      //    Логесим до/после, чтобы видеть, что реально пишет в Firestore
-      try {
-        await db.collection('users').doc(userUID).update({
-          activeTariffId: tariffId,
-          subscriptionStartDate: new Date()
-        });
-        console.log(`   → User ${userUID} updated: activeTariffId="${tariffId}"`);
-      } catch (e) {
-        console.error(`   ❌ Failed to update user ${userUID}:`, e);
+      const now = new Date();
+      const duration = tariffData.duration || '1 месяц'; // например, "1 месяц", "3 месяца"
+      const sessionCount = tariffData.sessionCount || 0;
+
+      // Парсим дату окончания
+      let subscriptionEndDate = new Date(now);
+      if (duration.includes('месяц')) {
+        const months = parseInt(duration);
+        subscriptionEndDate.setMonth(subscriptionEndDate.getMonth() + (months || 1));
+      } else if (duration.includes('день')) {
+        const days = parseInt(duration);
+        subscriptionEndDate.setDate(subscriptionEndDate.getDate() + (days || 30));
       }
+
+      // Обновляем пользователя
+      await db.collection('users').doc(userUID).update({
+        activeTariffId: tariffId,
+        subscriptionStartDate: now,
+        subscriptionEndDate: subscriptionEndDate,
+        remainingSessions: sessionCount
+      });
+
+      console.log(`→ User ${userUID} updated with tariff ${tariffId}, sessions=${sessionCount}, endDate=${subscriptionEndDate}`);
     }
+  } catch (e) {
+    console.error(`❌ Failed to update user ${userUID} with tariff data:`, e);
+  }
+}
+
 
     // 2) Обновляем сам документ payments (чтобы сохранить статус, paid, captured_at и т.д.)
     try {
