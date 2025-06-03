@@ -179,17 +179,17 @@ app.post('/api/payment', async (req: Request, res: Response) => {
     }
 
     // Сохраняем платеж в Firestore
-    const paymentData = {
-      userUID,
-      orderID,
-      tariffId,
-      value,
-      status: payment.status,
-      createdAt: FieldValue.serverTimestamp(),
-      paymentID: payment.id,
-      confirmation_url: confirmationUrl,
-      rawResponse: payment // Сохраняем полный ответ для отладки
-    };
+   const paymentData = {
+  userUID,
+  orderID,
+  tariffId,
+  value,
+  status: payment.status,
+  createdAt: FieldValue.serverTimestamp(),
+  paymentID: payment.id,
+  confirmation_url: payment.confirmation?.confirmation_url || null,
+  // Не сохраняем rawResponse вообще, если он не нужен
+};
 
     await db.collection('payments').doc(payment.id).set(paymentData);
 
