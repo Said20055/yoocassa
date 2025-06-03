@@ -130,50 +130,53 @@ app.post('/api/payment', async (req: Request, res: Response) => {
 
   const { value, userUID, orderID, return_url, tariffId } = req.body;
 
-  // Валидация входных данных
+  // Усиленная валидация
   if (!value || !userUID || !orderID || !return_url || !tariffId) {
     return res.status(400).json({
       error: 'Missing required fields',
-      required: ['value', 'userUID', 'orderID', 'return_url', 'tariffId'],
+      details: {
+        received: req.body,
+        required: ['value', 'userUID', 'orderID', 'return_url', 'tariffId']
+      }
     });
   }
 
   try {
-    // Проверяем существование пользователя и тарифа
-    const [userDoc, tariffDoc] = await Promise.all([
-      db.collection('users').doc(userUID).get(),
-      db.collection('tariffs').doc(tariffId).get(),
-    ]);
-
-    if (!userDoc.exists) {
-      return res.status(404).json({ error: 'User not found' });
-    }
-    if (!tariffDoc.exists) {
-      return res.status(404).json({ error: 'Tariff not found' });
-    }
-
-    // Создаем платеж в YooKassa
     const createPayload: ICreatePayment = {
       amount: {
         value: value,
-        currency: 'RUB',
+        currency: 'RUB'
       },
       payment_method_data: {
-        type: 'bank_card',
+        type: 'bank_card'
       },
       capture: true,
       confirmation: {
         type: 'redirect',
-        return_url: return_url,
+        return_url: return_url
       },
       metadata: {
         userUID,
         orderID,
-        tariffId,
-      },
+        tariffId
+      }
     };
 
+    // Добавляем лог перед созданием платежа
+    console.log('Creating payment with payload:', createPayload);
+
     const payment = await checkout.createPayment(createPayload, orderID);
+
+    // Проверка наличия confirmation
+    if (!payment || !payment.confirmation) {
+      throw new Error('Invalid payment response from YooKassa');
+    }
+
+    // Проверка confirmation_url
+    const confirmationUrl = payment.confirmation.confirmation_url;
+    if (!confirmationUrl) {
+      throw new Error('Missing confirmation URL in payment response');
+    }
 
     // Сохраняем платеж в Firestore
     const paymentData = {
@@ -184,27 +187,32 @@ app.post('/api/payment', async (req: Request, res: Response) => {
       status: payment.status,
       createdAt: FieldValue.serverTimestamp(),
       paymentID: payment.id,
-      confirmation_url: payment.confirmation?.confirmation_url || null,
-      tariffData: tariffDoc.data(),
+      confirmation_url: confirmationUrl,
+      rawResponse: payment // Сохраняем полный ответ для отладки
     };
 
     await db.collection('payments').doc(payment.id).set(paymentData);
 
-    // Возвращаем клиенту данные для редиректа
+    // Возвращаем только необходимые данные
     res.json({
+      success: true,
       paymentId: payment.id,
-      confirmationUrl: payment.confirmation?.confirmation_url,
-      status: payment.status,
+      confirmationUrl: confirmationUrl,
+      status: payment.status
     });
+
   } catch (error) {
     console.error('Payment creation error:', error);
+    
+    // Подробный ответ об ошибке
     res.status(500).json({
-      error: 'Payment failed',
-      details: (error as Error).message,
+      success: false,
+      error: 'Payment creation failed',
+      details: error instanceof Error ? error.message : 'Unknown error',
+      requestBody: req.body
     });
   }
 });
-
 // Эндпоинт для проверки статуса платежа
 app.get('/api/payment/:paymentId/status', async (req: Request, res: Response) => {
   try {
