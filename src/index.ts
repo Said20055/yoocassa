@@ -11,79 +11,91 @@ const app = express();
 const PORT = process.env.PORT || 4001;
 
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ 
+  verify: (req, res, buf) => {
+    (req as any).rawBody = buf;
+  }
+}));
 
-// Обработчик уведомлений от YooKassa
+// Функция для безопасного получения данных тарифа
+const getTariffData = (tariffDoc: FirebaseFirestore.DocumentSnapshot) => {
+  const data = tariffDoc.data() || {};
+  return {
+    title: data.title || 'Без названия',
+    duration: data.duration || '1 месяц',
+    sessionCount: data.sessionCount || 0,
+    price: data.price || 0,
+    isBest: data.isBest || false
+  };
+};
+
 app.post('/api/payment/notification', async (req: Request, res: Response) => {
   try {
     const { event, object } = req.body;
 
-    if (!object || !object.id) {
-      console.warn('❌ Invalid notification payload');
+    if (!object?.id) {
+      console.warn('❌ Invalid notification payload:', req.body);
       return res.status(400).json({ error: 'Invalid notification payload' });
     }
 
-    const paymentId = object.id;
-    const status = object.status;
-    const paid = object.paid || false;
-    const capturedAt = object.captured_at ? new Date(object.captured_at) : null;
-    const metadata = object.metadata || {};
-    const userUID = metadata.userUID;
-    const tariffId = metadata.tariffId;
+    const { id: paymentId, status, paid = false, captured_at, metadata = {} } = object;
+    const { userUID, tariffId } = metadata;
 
     console.log(`🔔 Payment notification: ${paymentId}, status: ${status}, user: ${userUID}`);
 
-    // Обновляем статус платежа
-    await db.collection('payments').doc(paymentId).update({
+    // Обновляем платеж
+    const paymentUpdate: any = {
       status,
       paid,
-      captured_at: capturedAt,
       updatedAt: FieldValue.serverTimestamp()
-    });
+    };
 
-    // Если платеж успешен, обновляем профиль пользователя
+    if (captured_at) {
+      paymentUpdate.captured_at = new Date(captured_at);
+    }
+
+    await db.collection('payments').doc(paymentId).update(paymentUpdate);
+
+    // Обновляем пользователя если платеж успешен
     if (status === 'succeeded' && paid && userUID && tariffId) {
       try {
         const tariffDoc = await db.collection('tariffs').doc(tariffId).get();
-        const tariff = tariffDoc.data();
+        const tariff = getTariffData(tariffDoc);
 
-        if (tariff) {
-          const startDate = new Date();
-          let endDate = new Date();
-          
-          // Рассчитываем дату окончания подписки
-          if (tariff.duration.includes('месяц')) {
-            const months = parseInt(tariff.duration) || 1;
-            endDate.setMonth(startDate.getMonth() + months);
-          } else {
-            const days = parseInt(tariff.duration) || 30;
-            endDate.setDate(startDate.getDate() + days);
-          }
-
-          await db.collection('users').doc(userUID).update({
-            activeTariffId: tariffId,
-            activeTariffName: tariff.title,
-            subscriptionStartDate: startDate,
-            subscriptionEndDate: endDate,
-            remainingSessions: tariff.sessionCount,
-            totalSessions: tariff.sessionCount,
-            isSubscriptionActive: true,
-            updatedAt: FieldValue.serverTimestamp()
-          });
+        const startDate = new Date();
+        const endDate = new Date(startDate);
+        
+        // Расчет даты окончания
+        if (tariff.duration.includes('месяц')) {
+          const months = parseInt(tariff.duration) || 1;
+          endDate.setMonth(startDate.getMonth() + months);
+        } else {
+          const days = parseInt(tariff.duration) || 30;
+          endDate.setDate(startDate.getDate() + days);
         }
+
+        await db.collection('users').doc(userUID).update({
+          activeTariffId: tariffId,
+          activeTariffName: tariff.title,
+          subscriptionStartDate: startDate,
+          subscriptionEndDate: endDate,
+          remainingSessions: tariff.sessionCount,
+          totalSessions: tariff.sessionCount,
+          isSubscriptionActive: true,
+          updatedAt: FieldValue.serverTimestamp()
+        });
       } catch (error) {
-        console.error(`❌ Failed to update user profile: ${error}`);
+        console.error(`❌ User update failed: ${error}`);
       }
     }
 
     res.status(200).json({ status: 'ok' });
   } catch (error) {
-    console.error('❌ Notification processing error:', error);
+    console.error('❌ Notification error:', error);
     res.status(500).json({ error: 'Failed to process notification' });
   }
 });
 
-// Обработчик создания платежа
 app.post('/api/payment', async (req: Request, res: Response) => {
   const checkout = new YooCheckout({
     shopId: process.env.YOO_SHOP_ID || '1097556',
@@ -92,79 +104,76 @@ app.post('/api/payment', async (req: Request, res: Response) => {
 
   const { value, userUID, orderID, return_url, tariffId } = req.body;
 
-  if (!value || !userUID || !orderID || !return_url || !tariffId) {
+  // Валидация
+  const missingFields = ['value', 'userUID', 'orderID', 'return_url', 'tariffId']
+    .filter(field => !req.body[field]);
+
+  if (missingFields.length > 0) {
     return res.status(400).json({ 
       error: 'Missing required fields',
-      details: req.body
+      missingFields
     });
   }
 
   try {
-    // Проверяем существование тарифа
+    // Проверяем тариф
     const tariffDoc = await db.collection('tariffs').doc(tariffId).get();
     if (!tariffDoc.exists) {
       return res.status(404).json({ error: 'Tariff not found' });
     }
 
-    const createPayload: ICreatePayment = {
-      amount: {
-        value: value,
-        currency: 'RUB'
-      },
-      payment_method_data: {
-        type: 'bank_card'
-      },
+    const tariff = getTariffData(tariffDoc);
+
+    // Создаем платеж
+    const payment = await checkout.createPayment({
+      amount: { value, currency: 'RUB' },
+      payment_method_data: { type: 'bank_card' },
       capture: true,
-      confirmation: {
-        type: 'redirect',
-        return_url: return_url
-      },
-      metadata: {
-        userUID,
-        orderID,
-        tariffId
-      }
-    };
+      confirmation: { type: 'redirect', return_url },
+      metadata: { userUID, orderID, tariffId }
+    }, orderID);
 
-    const payment = await checkout.createPayment(createPayload, orderID);
-
-    // Проверяем наличие confirmation_url
-    if (!payment.confirmation?.confirmation_url) {
-      throw new Error('No confirmation URL in payment response');
+    if (!payment?.confirmation?.confirmation_url) {
+      throw new Error('Invalid payment response: no confirmation URL');
     }
 
-    // Сохраняем платеж
-    await db.collection('payments').doc(payment.id).set({
+    // Подготовка данных для Firestore
+    const paymentData = {
       userUID,
       orderID,
       tariffId,
-      value,
+      value: Number(value),
       status: payment.status,
       createdAt: FieldValue.serverTimestamp(),
       paymentID: payment.id,
       confirmation_url: payment.confirmation.confirmation_url,
       tariffData: {
-        title: tariffDoc.data()?.title,
-        duration: tariffDoc.data()?.duration,
-        sessionCount: tariffDoc.data()?.sessionCount
-      }
-    });
+        title: tariff.title,
+        duration: tariff.duration,
+        sessionCount: tariff.sessionCount,
+        price: tariff.price
+      },
+      // Все остальные поля гарантированно имеют значения
+    };
+
+    await db.collection('payments').doc(payment.id).set(paymentData);
 
     res.json({
       success: true,
       paymentId: payment.id,
-      confirmationUrl: payment.confirmation.confirmation_url
+      confirmationUrl: payment.confirmation.confirmation_url,
+      amount: payment.amount
     });
 
   } catch (error) {
-    console.error('Payment creation error:', error);
+    console.error('Payment error:', error);
     res.status(500).json({ 
-      error: 'Payment creation failed',
+      error: 'Payment failed',
       details: error instanceof Error ? error.message : 'Unknown error'
     });
   }
 });
 
 app.listen(PORT, () => {
-  console.log(`Server running at http://localhost:${PORT}`);
+  console.log(`Server running on port ${PORT}`);
 });
