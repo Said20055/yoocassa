@@ -13,54 +13,7 @@ const PORT = process.env.PORT || 4001;
 app.use(cors());
 app.use(express.json());
 
-// Вспомогательная функция для обновления профиля пользователя
-async function updateUserProfile(
-  userId: string,
-  tariffId: string,
-  tariffData: any
-) {
-  const userRef = db.collection('users').doc(userId);
-  const tariffRef = db.collection('tariffs').doc(tariffId);
-
-  // Получаем данные тарифа
-  const tariffDoc = await tariffRef.get();
-  if (!tariffDoc.exists) {
-    throw new Error(`Tariff ${tariffId} not found`);
-  }
-  const tariff = tariffDoc.data();
-
-  // Рассчитываем дату окончания подписки
-  const startDate = new Date();
-  let endDate = new Date();
-  
-  if (tariff?.duration.includes('месяц')) {
-    const months = parseInt(tariff.duration) || 1;
-    endDate.setMonth(startDate.getMonth() + months);
-  } else if (tariff?.duration.includes('день')) {
-    const days = parseInt(tariff.duration) || 30;
-    endDate.setDate(startDate.getDate() + days);
-  } else {
-    // По умолчанию 1 месяц
-    endDate.setMonth(startDate.getMonth() + 1);
-  }
-
-  // Обновляем профиль пользователя
-  await userRef.update({
-    activeTariffId: tariffId,
-    activeTariffName: tariff?.title || 'Абонемент',
-    subscriptionStartDate: startDate,
-    subscriptionEndDate: endDate,
-    remainingSessions: tariff?.sessionCount || 0,
-    totalSessions: tariff?.sessionCount || 0,
-    paymentStatus: 'success',
-    lastPaymentId: FieldValue.serverTimestamp(),
-    isSubscriptionActive: true,
-    updatedAt: FieldValue.serverTimestamp(),
-  });
-
-  console.log(`User ${userId} profile updated with tariff ${tariffId}`);
-}
-
+// Обработчик уведомлений от YooKassa
 app.post('/api/payment/notification', async (req: Request, res: Response) => {
   try {
     const { event, object } = req.body;
@@ -75,43 +28,51 @@ app.post('/api/payment/notification', async (req: Request, res: Response) => {
     const paid = object.paid || false;
     const capturedAt = object.captured_at ? new Date(object.captured_at) : null;
     const metadata = object.metadata || {};
-    const userUID = metadata.userUID as string | undefined;
-    const tariffId = metadata.tariffId as string | undefined;
+    const userUID = metadata.userUID;
+    const tariffId = metadata.tariffId;
 
     console.log(`🔔 Payment notification: ${paymentId}, status: ${status}, user: ${userUID}`);
 
-    // Основное обновление платежа
-    const paymentUpdate: any = {
+    // Обновляем статус платежа
+    await db.collection('payments').doc(paymentId).update({
       status,
       paid,
-      updatedAt: FieldValue.serverTimestamp(),
-    };
+      captured_at: capturedAt,
+      updatedAt: FieldValue.serverTimestamp()
+    });
 
-    if (capturedAt) {
-      paymentUpdate.captured_at = capturedAt;
-    }
-
-    await db.collection('payments').doc(paymentId).update(paymentUpdate);
-
-    // Обновляем профиль пользователя, если платеж успешен и есть необходимые данные
+    // Если платеж успешен, обновляем профиль пользователя
     if (status === 'succeeded' && paid && userUID && tariffId) {
       try {
-        await updateUserProfile(userUID, tariffId, {
-          paymentId,
-          status,
-          capturedAt,
-        });
+        const tariffDoc = await db.collection('tariffs').doc(tariffId).get();
+        const tariff = tariffDoc.data();
 
-        // Дополнительно обновляем платеж информацией об успешной активации
-        await db.collection('payments').doc(paymentId).update({
-          userProfileUpdated: true,
-          profileUpdatedAt: FieldValue.serverTimestamp(),
-        });
+        if (tariff) {
+          const startDate = new Date();
+          let endDate = new Date();
+          
+          // Рассчитываем дату окончания подписки
+          if (tariff.duration.includes('месяц')) {
+            const months = parseInt(tariff.duration) || 1;
+            endDate.setMonth(startDate.getMonth() + months);
+          } else {
+            const days = parseInt(tariff.duration) || 30;
+            endDate.setDate(startDate.getDate() + days);
+          }
+
+          await db.collection('users').doc(userUID).update({
+            activeTariffId: tariffId,
+            activeTariffName: tariff.title,
+            subscriptionStartDate: startDate,
+            subscriptionEndDate: endDate,
+            remainingSessions: tariff.sessionCount,
+            totalSessions: tariff.sessionCount,
+            isSubscriptionActive: true,
+            updatedAt: FieldValue.serverTimestamp()
+          });
+        }
       } catch (error) {
         console.error(`❌ Failed to update user profile: ${error}`);
-        await db.collection('payments').doc(paymentId).update({
-          profileUpdateError: (error as Error).message,
-        });
       }
     }
 
@@ -122,6 +83,7 @@ app.post('/api/payment/notification', async (req: Request, res: Response) => {
   }
 });
 
+// Обработчик создания платежа
 app.post('/api/payment', async (req: Request, res: Response) => {
   const checkout = new YooCheckout({
     shopId: process.env.YOO_SHOP_ID || '1097556',
@@ -130,18 +92,20 @@ app.post('/api/payment', async (req: Request, res: Response) => {
 
   const { value, userUID, orderID, return_url, tariffId } = req.body;
 
-  // Усиленная валидация
   if (!value || !userUID || !orderID || !return_url || !tariffId) {
-    return res.status(400).json({
+    return res.status(400).json({ 
       error: 'Missing required fields',
-      details: {
-        received: req.body,
-        required: ['value', 'userUID', 'orderID', 'return_url', 'tariffId']
-      }
+      details: req.body
     });
   }
 
   try {
+    // Проверяем существование тарифа
+    const tariffDoc = await db.collection('tariffs').doc(tariffId).get();
+    if (!tariffDoc.exists) {
+      return res.status(404).json({ error: 'Tariff not found' });
+    }
+
     const createPayload: ICreatePayment = {
       amount: {
         value: value,
@@ -162,79 +126,45 @@ app.post('/api/payment', async (req: Request, res: Response) => {
       }
     };
 
-    // Добавляем лог перед созданием платежа
-    console.log('Creating payment with payload:', createPayload);
-
     const payment = await checkout.createPayment(createPayload, orderID);
 
-    // Проверка наличия confirmation
-    if (!payment || !payment.confirmation) {
-      throw new Error('Invalid payment response from YooKassa');
+    // Проверяем наличие confirmation_url
+    if (!payment.confirmation?.confirmation_url) {
+      throw new Error('No confirmation URL in payment response');
     }
 
-    // Проверка confirmation_url
-    const confirmationUrl = payment.confirmation.confirmation_url;
-    if (!confirmationUrl) {
-      throw new Error('Missing confirmation URL in payment response');
-    }
+    // Сохраняем платеж
+    await db.collection('payments').doc(payment.id).set({
+      userUID,
+      orderID,
+      tariffId,
+      value,
+      status: payment.status,
+      createdAt: FieldValue.serverTimestamp(),
+      paymentID: payment.id,
+      confirmation_url: payment.confirmation.confirmation_url,
+      tariffData: {
+        title: tariffDoc.data()?.title,
+        duration: tariffDoc.data()?.duration,
+        sessionCount: tariffDoc.data()?.sessionCount
+      }
+    });
 
-    // Сохраняем платеж в Firestore
-   const paymentData = {
-  userUID,
-  orderID,
-  tariffId,
-  value,
-  status: payment.status,
-  createdAt: FieldValue.serverTimestamp(),
-  paymentID: payment.id,
-  confirmation_url: payment.confirmation?.confirmation_url || null,
-  // Не сохраняем rawResponse вообще, если он не нужен
-};
-
-    await db.collection('payments').doc(payment.id).set(paymentData);
-
-    // Возвращаем только необходимые данные
     res.json({
       success: true,
       paymentId: payment.id,
-      confirmationUrl: confirmationUrl,
-      status: payment.status
+      confirmationUrl: payment.confirmation.confirmation_url
     });
 
   } catch (error) {
     console.error('Payment creation error:', error);
-    
-    // Подробный ответ об ошибке
-    res.status(500).json({
-      success: false,
+    res.status(500).json({ 
       error: 'Payment creation failed',
-      details: error instanceof Error ? error.message : 'Unknown error',
-      requestBody: req.body
+      details: error instanceof Error ? error.message : 'Unknown error'
     });
-  }
-});
-// Эндпоинт для проверки статуса платежа
-app.get('/api/payment/:paymentId/status', async (req: Request, res: Response) => {
-  try {
-    const { paymentId } = req.params;
-    const paymentDoc = await db.collection('payments').doc(paymentId).get();
-
-    if (!paymentDoc.exists) {
-      return res.status(404).json({ error: 'Payment not found' });
-    }
-
-    const paymentData = paymentDoc.data();
-    res.json({
-      status: paymentData?.status,
-      paid: paymentData?.paid,
-      userProfileUpdated: paymentData?.userProfileUpdated,
-    });
-  } catch (error) {
-    console.error('Payment status check error:', error);
-    res.status(500).json({ error: 'Failed to check payment status' });
   }
 });
 
 app.listen(PORT, () => {
-  console.log(`Payment service running on port ${PORT}`);
+  console.log(`Server running at http://localhost:${PORT}`);
 });
