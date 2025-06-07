@@ -263,7 +263,7 @@ app.post('/api/subscription/validate-qr', async (req: Request, res: Response) =>
 
     // 2. Проверяем срок действия (с точностью до секунды)
     const now = new Date();
-    const expiresAt = new Date(qrData.expiresAt);
+    const expiresAt = qrData.expiresAt.toDate();
     
     console.log(`⌚ Текущее время: ${now.toISOString()}, срок действия: ${expiresAt.toISOString()}`);
     
