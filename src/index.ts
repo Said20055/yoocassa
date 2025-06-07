@@ -256,7 +256,7 @@ app.post('/api/subscription/validate-qr', async (req: Request, res: Response) =>
     const qrData = qrSnap.data()!;
 
     // 2. Проверяем срок действия
-    if (new Date(qrData.expiresAt) < new Date()) {
+    if (new Date(qrData.expiresAt) < new Date(Date.now())) {
       return res.status(400).json({ error: 'QR code expired' });
     }
 
