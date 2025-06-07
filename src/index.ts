@@ -244,58 +244,121 @@ app.post('/api/subscription/generate-qr', async (req: Request, res: Response) =>
  */
 app.post('/api/subscription/validate-qr', async (req: Request, res: Response) => {
   const { qrCode, adminId } = req.body;
+  console.log(`🔍 Попытка валидации QR-кода: ${qrCode} администратором: ${adminId}`);
 
   try {
-    // 1. Получаем код
+    // 1. Проверяем существование QR-кода
     const qrSnap = await db.collection('qr_codes').doc(qrCode).get();
     
     if (!qrSnap.exists) {
-      return res.status(404).json({ error: 'Invalid QR code' });
+      console.warn(`❌ QR-код не найден: ${qrCode}`);
+      return res.status(404).json({ 
+        error: 'Неверный QR-код',
+        code: 'invalid_qr'
+      });
     }
 
     const qrData = qrSnap.data()!;
+    console.log(`ℹ️ Найден QR-код:`, qrData);
 
-    // 2. Проверяем срок действия
-    if (new Date(qrData.expiresAt) < new Date(Date.now())) {
-      return res.status(400).json({ error: 'QR code expired' });
-    }
-
-    if (qrData.isUsed) {
-      return res.status(400).json({ error: 'QR code already used' });
-    }
-
-    // 3. Помечаем как использованный
-    await qrSnap.ref.update({ 
-      isUsed: true,
-      usedAt: new Date(),
-      adminId 
-    });
-
-    // 4. Обновляем абонемент
-    const subRef = db.collection('subscriptions').doc(qrData.subscriptionId);
-    await db.runTransaction(async (t) => {
-      const subSnap = await t.get(subRef);
-      const subData = subSnap.data()!;
-      
-      t.update(subRef, {
-        remainingSessions: subData.remainingSessions - 1,
-        lastUsed: new Date()
+    // 2. Проверяем срок действия (с точностью до секунды)
+    const now = new Date();
+    const expiresAt = new Date(qrData.expiresAt);
+    
+    console.log(`⌚ Текущее время: ${now.toISOString()}, срок действия: ${expiresAt.toISOString()}`);
+    
+    if (expiresAt < now) {
+      console.warn(`⌛ QR-код просрочен: разница ${(now.getTime() - expiresAt.getTime())/1000} сек`);
+      return res.status(400).json({ 
+        error: 'QR-код просрочен',
+        code: 'qr_expired',
+        expiredAt: expiresAt.toISOString()
       });
+    }
+
+    // 3. Проверяем, не использован ли уже код
+    if (qrData.isUsed) {
+      console.warn(`⚠️ QR-код уже использован: использован в ${qrData.usedAt}`);
+      return res.status(400).json({ 
+        error: 'QR-код уже использован',
+        code: 'qr_already_used'
+      });
+    }
+
+    // 4. Проверяем права администратора
+    const adminDoc = await db.collection('admins').doc(adminId).get();
+    if (!adminDoc.exists) {
+      console.warn(`⛔ Неавторизованный администратор: ${adminId}`);
+      return res.status(403).json({ 
+        error: 'Доступ запрещен',
+        code: 'admin_not_found'
+      });
+    }
+
+    console.log(`👮 Администратор подтвержден: ${adminDoc.data()?.email}`);
+
+    // 5. Обновляем статус QR-кода
+    const batch = db.batch();
+    
+    batch.update(qrSnap.ref, { 
+      isUsed: true,
+      usedAt: now,
+      adminId: adminId
     });
 
-    // 5. Записываем историю использования
-    await db.collection('subscription_usage').add({
+    // 6. Обновляем абонемент
+    const subRef = db.collection('subscriptions').doc(qrData.subscriptionId);
+    const subSnap = await subRef.get();
+    
+    if (!subSnap.exists) {
+      console.error(`❌ Абонемент не найден: ${qrData.subscriptionId}`);
+      return res.status(404).json({ 
+        error: 'Абонемент не найден',
+        code: 'subscription_not_found'
+      });
+    }
+
+    const subData = subSnap.data()!;
+    const newRemaining = subData.remainingSessions - 1;
+    
+    if (newRemaining < 0) {
+      console.warn(`⚠️ Недостаточно сессий: ${subData.remainingSessions}`);
+      return res.status(400).json({ 
+        error: 'Недостаточно сессий в абонементе',
+        code: 'no_sessions_left'
+      });
+    }
+
+    batch.update(subRef, {
+      remainingSessions: newRemaining,
+      lastUsed: now
+    });
+
+    // 7. Записываем историю
+    const usageRef = db.collection('subscription_usage').doc();
+    batch.set(usageRef, {
       subscriptionId: qrData.subscriptionId,
       userId: qrData.userId,
-      adminId,
-      usedAt: new Date(),
-      qrCode
+      adminId: adminId,
+      usedAt: now,
+      qrCode: qrCode,
+      remainingSessions: newRemaining
     });
 
-    res.json({ success: true });
+    await batch.commit();
+    
+    console.log(`✅ QR-код успешно подтвержден. Осталось сессий: ${newRemaining}`);
+    
+    res.json({ 
+      success: true,
+      remainingSessions: newRemaining
+    });
 
   } catch (error) {
-    console.error('QR validation error:', error);
-    res.status(500).json({ error: 'Failed to validate QR code' });
+    console.error('🔥 Ошибка при валидации QR-кода:', error);
+    res.status(500).json({ 
+      error: 'Внутренняя ошибка сервера',
+      code: 'server_error'
+    });
   }
 });
