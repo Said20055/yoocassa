@@ -52,22 +52,41 @@ app.post('/api/payment/notification', async (req: Request, res: Response) => {
     }
 
     // 2. Если платеж успешен и есть необходимые метаданные - создаем абонемент
-    if (paid && userUID && tariffId) {
-      try {
-        // Загружаем данные тарифа
-        const tariffSnap = await db.collection('tariffs').doc(tariffId).get();
-        const tariffData = tariffSnap.data();
+if (paid && userUID && tariffId) {
+  try {
+    // Загружаем данные тарифа
+    const tariffSnap = await db.collection('tariffs').doc(tariffId).get();
+    const tariffData = tariffSnap.data();
 
-        if (!tariffData) {
-          console.warn(`❌ Tariff not found: ${tariffId}`);
-          return res.status(200).json({ status: 'ok' }); // Все равно возвращаем 200 для ЮKassa
-        }
+    if (!tariffData) {
+      console.warn(`❌ Tariff not found: ${tariffId}`);
+      return res.status(200).json({ status: 'ok' }); // ЮKassa требует 200
+    }
 
-        const now = new Date();
-        const duration = tariffData.duration || '1 месяц';
-        const sessionCount = tariffData.sessionCount || 0;
+    const now = new Date();
+    const duration = tariffData.duration || '1 месяц';
+    const sessionCount = tariffData.sessionCount || 0;
 
-        // Рассчитываем дату окончания
+    // Проверяем существующую активную подписку
+    const existingSubSnap = await db.collection('subscriptions')
+      .where('userId', '==', userUID)
+      .where('isActive', '==', true)
+      .limit(1)
+      .get();
+
+    if (!existingSubSnap.empty) {
+      const existingSubDoc = existingSubSnap.docs[0];
+      const existingSubData = existingSubDoc.data();
+
+      if (existingSubData.remainingSessions > 0) {
+        console.log(`⚠️ У пользователя ${userUID} уже есть активная подписка с ${existingSubData.remainingSessions} сессиями.`);
+        return res.status(200).json({
+          status: 'exists',
+          message: 'У вас уже есть активная подписка с оставшимися сессиями',
+          remainingSessions: existingSubData.remainingSessions
+        });
+      } else {
+        // Обновляем существующую подписку новыми данными
         let endDate = new Date(now);
         if (duration.includes('месяц')) {
           const months = parseInt(duration) || 1;
@@ -77,9 +96,7 @@ app.post('/api/payment/notification', async (req: Request, res: Response) => {
           endDate.setDate(endDate.getDate() + days);
         }
 
-        // Создаем новый абонемент
-        const subscriptionRef = await db.collection('subscriptions').add({
-          userId: userUID,
+        await existingSubDoc.ref.update({
           tariffId: tariffId,
           paymentId: paymentId,
           startDate: now,
@@ -91,22 +108,63 @@ app.post('/api/payment/notification', async (req: Request, res: Response) => {
           lastUsed: null
         });
 
-        console.log(`   → Created subscription ${subscriptionRef.id} for user ${userUID}`);
+        console.log(`🔄 Обновлена существующая подписка ${existingSubDoc.id} для пользователя ${userUID}`);
 
-        // Обновляем пользователя (существующая логика)
+        // Обновляем пользователя
         await db.collection('users').doc(userUID).update({
           activeTariffId: tariffId,
           subscriptionStartDate: now,
           subscriptionEndDate: endDate,
           remainingSessions: sessionCount,
-          activeSubscriptionId: subscriptionRef.id // Добавляем ссылку на абонемент
+          activeSubscriptionId: existingSubDoc.id
         });
 
-      } catch (e) {
-        console.error(`❌ Failed to create subscription:`, e);
-        // Не прерываем выполнение, просто логируем ошибку
+        return res.status(200).json({
+          status: 'updated',
+          message: 'Существующая подписка обновлена',
+          remainingSessions: sessionCount
+        });
       }
     }
+
+    // Если подписки не было — создаём новую
+    let endDate = new Date(now);
+    if (duration.includes('месяц')) {
+      const months = parseInt(duration) || 1;
+      endDate.setMonth(endDate.getMonth() + months);
+    } else if (duration.includes('день')) {
+      const days = parseInt(duration) || 30;
+      endDate.setDate(endDate.getDate() + days);
+    }
+
+    const subscriptionRef = await db.collection('subscriptions').add({
+      userId: userUID,
+      tariffId: tariffId,
+      paymentId: paymentId,
+      startDate: now,
+      endDate: endDate,
+      totalSessions: sessionCount,
+      remainingSessions: sessionCount,
+      isActive: true,
+      createdAt: now,
+      lastUsed: null
+    });
+
+    console.log(`✅ Создана новая подписка ${subscriptionRef.id} для пользователя ${userUID}`);
+
+    await db.collection('users').doc(userUID).update({
+      activeTariffId: tariffId,
+      subscriptionStartDate: now,
+      subscriptionEndDate: endDate,
+      remainingSessions: sessionCount,
+      activeSubscriptionId: subscriptionRef.id
+    });
+
+  } catch (e) {
+    console.error(`❌ Ошибка при создании/обновлении подписки:`, e);
+  }
+}
+
 
     // Всегда возвращаем 200 для ЮKassa
     res.status(200).json({ status: 'ok' });
