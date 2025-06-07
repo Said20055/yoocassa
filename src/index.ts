@@ -78,7 +78,7 @@ if (paid && userUID && tariffId) {
       const existingSubDoc = existingSubSnap.docs[0];
       const existingSubData = existingSubDoc.data();
 
-      if (existingSubData.remainingSessions > 0 && existingSubSnap.endDate.toDate() > now) {
+      if (existingSubData.remainingSessions > 0 && existingSubData.endDate.toDate() > now) {
         console.log(`⚠️ У пользователя ${userUID} уже есть активная подписка с ${existingSubData.remainingSessions} сессиями.`);
         return res.status(200).json({
           status: 'exists',
